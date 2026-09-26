@@ -16,6 +16,7 @@ from .models import (
     BatchRunnerResult,
     CheckinCreate,
     CheckinOut,
+    CheckinSelection,
     CorrectionPreview,
     PreviewCorrectionOut,
     PublicationOut,
@@ -23,7 +24,9 @@ from .models import (
     RunnerSummary,
     Segment,
     SegmentChange,
+    SplitsExplainOut,
     SplitsOut,
+    StationSelection,
     StationTime,
 )
 
@@ -283,7 +286,8 @@ def get_splits(conn: sqlite3.Connection, runner_id: str) -> SplitsOut:
 def _compute_splits(conn: sqlite3.Connection, runner_id: str) -> SplitsOut:
     """按站点顺序重算某选手的相邻站分段用时。
 
-    - 仅统计 status='active' 的打卡；同站多条有效打卡取最早时间；
+    - 仅统计 status='active' 的打卡；同站多条有效打卡按 (UTC 时间, 事件号)
+      升序取第一条（与 splits/explain 的入选规则一致）；
     - 相邻站缺打卡或时间倒退的分段标记为 pending 并说明原因；
     - 每次查询都基于最新数据重算，因此补传、更正、撤销即时生效。
     """
@@ -291,15 +295,28 @@ def _compute_splits(conn: sqlite3.Connection, runner_id: str) -> SplitsOut:
         "SELECT * FROM checkins WHERE runner_id = ? AND status = ?",
         (runner_id, ACTIVE),
     ).fetchall()
+    return _splits_from_best(_select_best(rows), runner_id)
 
-    # 同站多条有效打卡取最早时间
+
+def _select_best(rows: list[sqlite3.Row]) -> dict[int, tuple[datetime, str]]:
+    """同站多条有效打卡按 (UTC 时间, 事件号) 升序选一条。
+
+    返回 站点序号 -> (入选时间, 入选事件号)；时间相同（平局）时取事件号
+    较小者，保证结果确定，且与 splits/explain 给出的解释一致。
+    """
     best: dict[int, tuple[datetime, str]] = {}
     for r in rows:
-        t = datetime.fromisoformat(r["occurred_at"])
+        key = (datetime.fromisoformat(r["occurred_at"]), r["event_no"])
         cur = best.get(r["station_seq"])
-        if cur is None or t < cur[0]:
-            best[r["station_seq"]] = (t, r["event_no"])
+        if cur is None or key < cur:
+            best[r["station_seq"]] = key
+    return best
 
+
+def _splits_from_best(
+    best: dict[int, tuple[datetime, str]], runner_id: str
+) -> SplitsOut:
+    """由"站点 -> 入选 (时间, 事件号)"按相邻站规则计算分段结果。"""
     count = station_count()
     stations = [
         StationTime(station_seq=seq, event_no=ev, occurred_at=t)
@@ -372,6 +389,74 @@ def _summary(splits: SplitsOut) -> RunnerSummary:
         complete=splits.complete,
         total_seconds=splits.total_seconds,
         total=splits.total,
+    )
+
+
+def explain_splits(conn: sqlite3.Connection, runner_id: str) -> SplitsExplainOut:
+    """解释实时分段采用哪些打卡，并返回按入选事件计算的现有分段结果。
+
+    单次查询取出该选手全部打卡（含已更正 / 已撤销），入选解释与分段结果
+    在这同一批数据上推导，二者严格一致；每次查询都基于最新数据，因此
+    更正、撤销、补传即时反映到解释中。
+    """
+    rows = conn.execute(
+        "SELECT * FROM checkins WHERE runner_id = ?"
+        " ORDER BY station_seq, occurred_at, event_no",
+        (runner_id,),
+    ).fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"选手 {runner_id} 无任何打卡记录")
+
+    # 仅 active 参与入选；同站按 (UTC 时间, 事件号) 升序选一条
+    best = _select_best([r for r in rows if r["status"] == ACTIVE])
+    # 被更正事件号 -> 取代它的事件号（仅限同选手记录内可关联时）
+    corrected_by = {r["corrects"]: r["event_no"] for r in rows if r["corrects"]}
+
+    stations: list[StationSelection] = []
+    for row in rows:  # 已按站点、时间、事件号排序
+        if not stations or stations[-1].station_seq != row["station_seq"]:
+            stations.append(
+                StationSelection(station_seq=row["station_seq"], checkins=[])
+            )
+        stations[-1].checkins.append(_selection_for(row, best, corrected_by))
+
+    return SplitsExplainOut(
+        runner_id=runner_id,
+        station_count=station_count(),
+        stations=stations,
+        splits=_splits_from_best(best, runner_id),
+    )
+
+
+def _selection_for(
+    row: sqlite3.Row,
+    best: dict[int, tuple[datetime, str]],
+    corrected_by: dict[str, str],
+) -> CheckinSelection:
+    """生成单条打卡的入选情况；未入选时说明原因。"""
+    chosen = best.get(row["station_seq"])
+    selected = (
+        row["status"] == ACTIVE
+        and chosen is not None
+        and row["event_no"] == chosen[1]
+    )
+    reason = None
+    if not selected:
+        if row["status"] == SUPERSEDED:
+            by = corrected_by.get(row["event_no"])
+            reason = f"已更正：被事件 {by} 取代" if by else "已更正"
+        elif row["status"] == REVOKED:
+            reason = "已撤销"
+        elif chosen is not None and datetime.fromisoformat(row["occurred_at"]) == chosen[0]:
+            reason = f"同时间平局：事件号大于入选事件 {chosen[1]}"
+        else:
+            reason = f"较晚：同站入选事件 {chosen[1]} 时间更早"
+    return CheckinSelection(
+        event_no=row["event_no"],
+        occurred_at=datetime.fromisoformat(row["occurred_at"]),
+        status=row["status"],
+        selected=selected,
+        reason=reason,
     )
 
 

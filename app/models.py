@@ -60,6 +60,42 @@ class SplitsOut(BaseModel):
     segments: list[Segment]
 
 
+class CheckinSelection(BaseModel):
+    """单条打卡在实时分段计算中的入选情况。"""
+
+    event_no: str
+    occurred_at: datetime
+    status: str = Field(..., description="active=有效，superseded=已被更正，revoked=已撤销")
+    selected: bool = Field(..., description="是否被实时分段采用")
+    reason: Optional[str] = Field(
+        default=None,
+        description="未入选原因：已更正 / 已撤销 / 较晚 / 同时间平局；入选时为 null",
+    )
+
+
+class StationSelection(BaseModel):
+    """同一站点的全部打卡及各自的入选情况。"""
+
+    station_seq: int
+    checkins: list[CheckinSelection] = Field(
+        ..., description="该站全部打卡，按 (UTC 时间, 事件号) 升序"
+    )
+
+
+class SplitsExplainOut(BaseModel):
+    """实时分段的入选解释，以及按入选事件计算的现有分段结果。
+
+    stations 与 splits 基于同一次数据库读取推导，二者严格一致。
+    """
+
+    runner_id: str
+    station_count: int
+    stations: list[StationSelection] = Field(
+        ..., description="按站点列出全部打卡的事件号、时间、状态及是否入选"
+    )
+    splits: SplitsOut = Field(..., description="按入选事件计算的现有分段结果")
+
+
 class RunnerSummary(BaseModel):
     """某一时点上选手的完成状态与总用时。"""
 
