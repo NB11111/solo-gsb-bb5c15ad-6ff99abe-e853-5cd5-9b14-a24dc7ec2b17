@@ -16,6 +16,7 @@ from .models import (
     BatchRunnerResult,
     CheckinCreate,
     CheckinOut,
+    CheckinSelection,
     CorrectionPreview,
     PreviewCorrectionOut,
     PublicationOut,
@@ -23,13 +24,21 @@ from .models import (
     RunnerSummary,
     Segment,
     SegmentChange,
+    SplitsExplainOut,
     SplitsOut,
+    StationSelection,
     StationTime,
 )
 
 ACTIVE = "active"
 SUPERSEDED = "superseded"
 REVOKED = "revoked"
+
+# 解释接口中未入选打卡的原因
+REASON_SUPERSEDED = "已更正"
+REASON_REVOKED = "已撤销"
+REASON_LATER = "较晚"
+REASON_TIE = "同时间平局"
 
 
 def station_count() -> int:
@@ -216,7 +225,8 @@ def create_checkins_batch(
         # 全部写入后按现有分段规则重算受影响选手的最终结果
         affected = [
             BatchRunnerResult(
-                runner_id=rid, **_summary(_compute_splits(conn, rid)).model_dump()
+                runner_id=rid,
+                **_summary(_build_splits(rid, _fetch_runner_rows(conn, rid))).model_dump(),
             )
             for rid in runner_ids
         ]
@@ -271,34 +281,119 @@ def list_checkins(
 
 
 def get_splits(conn: sqlite3.Connection, runner_id: str) -> SplitsOut:
-    """按站点顺序重算某选手的相邻站分段用时（详见 _compute_splits）。"""
-    any_row = conn.execute(
-        "SELECT 1 FROM checkins WHERE runner_id = ? LIMIT 1", (runner_id,)
-    ).fetchone()
-    if any_row is None:
+    """按站点顺序重算某选手的相邻站分段用时（详见 _build_splits）。"""
+    rows = _fetch_runner_rows(conn, runner_id)
+    if not rows:
         raise HTTPException(status_code=404, detail=f"选手 {runner_id} 无任何打卡记录")
-    return _compute_splits(conn, runner_id)
+    return _build_splits(runner_id, rows)
 
 
-def _compute_splits(conn: sqlite3.Connection, runner_id: str) -> SplitsOut:
-    """按站点顺序重算某选手的相邻站分段用时。
+def explain_splits(
+    conn: sqlite3.Connection, runner_id: str
+) -> SplitsExplainOut:
+    """解释实时分段采用了哪些打卡，并同时返回基于同一批读取行计算的分段。
 
-    - 仅统计 status='active' 的打卡；同站多条有效打卡取最早时间；
+    打卡只查询一次：入选解释与分段结果共用同一份内存中的行快照，
+    因此二者必然基于同一次数据库读取；补传、更正、撤销后再次调用即即时更新。
+    checkins 表中无该选手任何记录（含状态为已撤销 / 已更正的记录）时返回 404。
+    """
+    rows = _fetch_runner_rows(conn, runner_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"选手 {runner_id} 无任何打卡记录")
+
+    # 同站按 UTC 时间升序、事件号升序分组（_fetch_runner_rows 已排好序）
+    by_station: dict[int, list[sqlite3.Row]] = {}
+    for r in rows:
+        by_station.setdefault(r["station_seq"], []).append(r)
+
+    best = _select_best(rows)
+    stations = []
+    for seq in sorted(by_station):
+        winner = best.get(seq)
+        selected_event = winner[1] if winner is not None else None
+        checkins = []
+        for r in by_station[seq]:
+            selected = r["event_no"] == selected_event
+            checkins.append(
+                CheckinSelection(
+                    event_no=r["event_no"],
+                    occurred_at=datetime.fromisoformat(r["occurred_at"]),
+                    status=r["status"],
+                    selected=selected,
+                    reason=None if selected else _excluded_reason(r, winner),
+                )
+            )
+        stations.append(
+            StationSelection(
+                station_seq=seq,
+                selected_event_no=selected_event,
+                checkins=checkins,
+            )
+        )
+
+    return SplitsExplainOut(
+        runner_id=runner_id,
+        station_count=station_count(),
+        stations=stations,
+        splits=_build_splits(runner_id, rows),
+    )
+
+
+def _excluded_reason(
+    row: sqlite3.Row, winner: tuple[datetime, str] | None
+) -> str:
+    """未入选打卡的原因：非 active 记录说明状态，active 落败记录按时间 / 平局区分。
+
+    winner 为 None 表示本站无有效打卡（此时记录必为非 active，前两个分支即返回）。
+    """
+    if row["status"] == SUPERSEDED:
+        return REASON_SUPERSEDED
+    if row["status"] == REVOKED:
+        return REASON_REVOKED
+    t = datetime.fromisoformat(row["occurred_at"])
+    return REASON_TIE if t == winner[0] else REASON_LATER
+
+
+def _fetch_runner_rows(
+    conn: sqlite3.Connection, runner_id: str
+) -> list[sqlite3.Row]:
+    """读取某选手的全部打卡（含已更正 / 已撤销），单次查询、单次数据库读取。
+
+    排序：站点序号升序；同站内按 UTC 时间升序、事件号升序
+    （occurred_at 统一归一化为 UTC 后按 ISO 字符串存储，字典序即时间序）。
+    """
+    return conn.execute(
+        "SELECT * FROM checkins WHERE runner_id = ?"
+        " ORDER BY station_seq, occurred_at, event_no",
+        (runner_id,),
+    ).fetchall()
+
+
+def _select_best(
+    rows: list[sqlite3.Row],
+) -> dict[int, tuple[datetime, str]]:
+    """实时分段的入选规则：仅 active 参与；同站按 UTC 时间升序、事件号升序取一条。"""
+    best: dict[int, tuple[datetime, str]] = {}
+    for r in rows:
+        if r["status"] != ACTIVE:
+            continue
+        t = datetime.fromisoformat(r["occurred_at"])
+        cur = best.get(r["station_seq"])
+        if cur is None or (t, r["event_no"]) < cur:
+            best[r["station_seq"]] = (t, r["event_no"])
+    return best
+
+
+def _build_splits(runner_id: str, rows: list[sqlite3.Row]) -> SplitsOut:
+    """按站点顺序重算某选手的相邻站分段用时（入行为同一次读取的快照）。
+
+    - 仅统计 status='active' 的打卡；同站多条有效打卡取最早时间，
+      时间相同取事件号较小者（与解释接口的入选规则一致）；
     - 相邻站缺打卡或时间倒退的分段标记为 pending 并说明原因；
     - 每次查询都基于最新数据重算，因此补传、更正、撤销即时生效。
     """
-    rows = conn.execute(
-        "SELECT * FROM checkins WHERE runner_id = ? AND status = ?",
-        (runner_id, ACTIVE),
-    ).fetchall()
-
-    # 同站多条有效打卡取最早时间
-    best: dict[int, tuple[datetime, str]] = {}
-    for r in rows:
-        t = datetime.fromisoformat(r["occurred_at"])
-        cur = best.get(r["station_seq"])
-        if cur is None or t < cur[0]:
-            best[r["station_seq"]] = (t, r["event_no"])
+    # 同站多条有效打卡取最早时间（时间相同取事件号较小者）
+    best = _select_best(rows)
 
     count = station_count()
     stations = [
@@ -390,13 +485,18 @@ def preview_correction(
     if payload.runner_id not in runner_ids:
         runner_ids.append(payload.runner_id)
 
-    before = {rid: _compute_splits(conn, rid) for rid in runner_ids}
+    before = {
+        rid: _build_splits(rid, _fetch_runner_rows(conn, rid)) for rid in runner_ids
+    }
 
     occurred = _to_utc(payload.occurred_at)
     conn.execute("SAVEPOINT preview_correction")
     try:
         _insert_correction(conn, payload, occurred, _now())
-        after = {rid: _compute_splits(conn, rid) for rid in runner_ids}
+        after = {
+            rid: _build_splits(rid, _fetch_runner_rows(conn, rid))
+            for rid in runner_ids
+        }
     finally:
         conn.execute("ROLLBACK TO SAVEPOINT preview_correction")
         conn.execute("RELEASE SAVEPOINT preview_correction")
@@ -450,7 +550,10 @@ def publish_results(conn: sqlite3.Connection) -> PublicationOut:
         rows = conn.execute(
             "SELECT DISTINCT runner_id FROM checkins ORDER BY runner_id"
         ).fetchall()
-        results = [_compute_splits(conn, row["runner_id"]) for row in rows]
+        results = [
+            _build_splits(row["runner_id"], _fetch_runner_rows(conn, row["runner_id"]))
+            for row in rows
+        ]
 
         count = station_count()
         cursor = conn.execute(

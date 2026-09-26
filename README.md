@@ -12,22 +12,32 @@
 - 支持**成绩发布**：在同一 SQLite 事务内读取当前打卡、按现有分段规则为所有有记录选手
   （含未完赛、保留 `pending` 分段者）生成**单调递增、不可变的版本快照**并整版原子保存；
 - 已发布版本按版本号 / 最新版查询；后续打卡、更正或撤销只影响实时成绩，**不改已发布版本**；
-- 提供选手分段结果查询。
+- 提供选手分段结果查询，并提供**分段入选解释**：逐站列出该选手全部打卡的事件号、时间、状态
+  及是否入选（仅 `active` 参与，同站按 UTC 时间升序、事件号升序取一条），并注明未入选原因
+  （已更正 / 已撤销 / 较晚 / 同时间平局），解释与分段结果基于同一次数据库读取。
 
 ## 启动
+
+**单条命令一键启动**（需安装 Docker；自动构建镜像、建库建表、播种示例数据并在 8000 端口提供服务）：
 
 ```bash
 docker compose up --build
 ```
 
-一条命令即可：容器启动时自动建表，数据库为空时写入示例数据（选手 R001–R006，覆盖完整成绩、乱序补传、缺站、更正、撤销、时间倒退等场景）。
+容器启动时自动建表，数据库为空时写入示例数据（选手 R001–R006，覆盖完整成绩、乱序补传、缺站、
+更正、撤销、时间倒退等场景）；停止可用 `Ctrl+C`，后台运行用 `docker compose up --build -d`。
 
 - 本地端口：**8000**
-- API 地址：http://localhost:8000
+- API 地址（基址）：http://localhost:8000
 - 交互式文档（Swagger UI）：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/api/health
 
+> 不使用 Compose 时也可用 Docker 原生命令单条启动：
+> `docker run --rm -p 8000:8000 -e STATION_COUNT=6 -v timing-data:/data $(docker build -q .)`
+
 ## 配置（环境变量）
+
+启动无需任何必填配置；以下变量均有默认值，按需通过 Compose 的 `environment` 或 `docker run -e` 覆盖：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -47,6 +57,7 @@ Compose 通过命名卷 `timing-data` 持久化数据；删除卷（`docker comp
 | `GET` | `/api/checkins?runner_id=` | 打卡列表（含已更正 / 已撤销记录） |
 | `GET` | `/api/checkins/{event_no}` | 按事件号查询单条打卡 |
 | `GET` | `/api/runners/{runner_id}/splits` | 选手实时分段结果 |
+| `GET` | `/api/runners/{runner_id}/splits/explain` | 解释实时分段采用哪些打卡（逐站列出全部打卡及入选原因），同时返回基于同一次读取的分段结果；无打卡记录返回 404 |
 | `POST` | `/api/publications` | 发布成绩版本：同一事务读取当前打卡、整版快照原子保存，返回新版本完整成绩 |
 | `GET` | `/api/publications/{version}` | 按版本号查询该版本完整成绩（不存在返回 404） |
 | `GET` | `/api/publications/latest` | 查询最新发布版本完整成绩（尚未发布时返回 404） |
@@ -179,6 +190,61 @@ curl http://localhost:8000/api/runners/R001/splits
 }
 ```
 
+## 分段入选解释
+
+`GET /api/runners/{runner_id}/splits/explain` 解释实时分段**采用了哪些打卡**：按站点序号列出该选手
+的**全部打卡**（含已更正 / 已撤销记录）的事件号、时间、状态及是否入选，并在同一响应中返回按这些
+入选事件计算的现有分段结果（`splits`）。
+
+入选规则与实时分段完全一致：
+
+- **仅 `active`（有效）打卡参与**；`superseded`（已更正）、`revoked`（已撤销）一律不入选；
+- 同一站点在有效打卡中**按 UTC 时间升序、事件号升序取第一条**（时间最早；同时间取事件号较小者）；
+- 未入选记录的 `reason`：`已更正` / `已撤销` / `较晚`（同站有更早的有效打卡）/ `同时间平局`
+  （时间相同但事件号更大）；入选记录 `reason` 为 `null`；
+- 某站没有任何有效打卡时 `selected_event_no` 为 `null`（该站相邻分段按缺站处理为 `pending`）；
+- 解释与 `splits` 中的打卡行**只从数据库读取一次**，二者共用同一快照，不可能出现解释与分段不一致；
+- 结果在查询时实时重算，**更正、撤销、补传后再次调用即即时更新**；
+- 该选手无任何打卡记录（连已撤销 / 已更正记录都没有）时返回 `404`。
+
+```bash
+curl http://localhost:8000/api/runners/R004/splits/explain
+```
+
+示例选手 R004 的第 2 站曾录入错误时间 12:30（`S-R004-2X`），随后由 08:40 的 `S-R004-2` 更正，响应节选：
+
+```json
+{
+  "runner_id": "R004",
+  "station_count": 6,
+  "stations": [
+    {
+      "station_seq": 2,
+      "selected_event_no": "S-R004-2",
+      "checkins": [
+        {"event_no": "S-R004-2",  "occurred_at": "2026-09-25T08:40:00+00:00", "status": "active",     "selected": true,  "reason": null},
+        {"event_no": "S-R004-2X", "occurred_at": "2026-09-25T12:30:00+00:00", "status": "superseded", "selected": false, "reason": "已更正"}
+      ]
+    }
+  ],
+  "splits": {
+    "runner_id": "R004",
+    "complete": true,
+    "total_seconds": 12480,
+    "total": "3:28:00",
+    "stations": [
+      {"station_seq": 1, "event_no": "S-R004-1", "occurred_at": "…"}
+    ],
+    "segments": [
+      {"from_station": 1, "to_station": 2, "status": "ok", "duration_seconds": 2280, "duration": "0:38:00"}
+    ]
+  }
+}
+```
+
+`stations` 按站点序号升序、站内 `checkins` 按 UTC 时间升序（同时间按事件号升序）排列；
+`splits` 的结构与字段与 `GET /api/runners/{runner_id}/splits` 完全相同。
+
 ## 成绩发布与版本查询
 
 发布（无需请求体）：在**同一 SQLite 事务**内先取得写锁再读取全部当前打卡，按现有分段规则
@@ -265,6 +331,10 @@ pytest                               # 运行测试
 
 - 打卡记录永久保留，更正 / 撤销只改变状态（`active` / `superseded` / `revoked`），便于审计；
 - 分段结果在查询时基于全部有效打卡实时重算，因此补传、更正、撤销立即反映到结果中；
+- 同站入选规则统一为"仅 `active` 参与，按 UTC 时间升序、事件号升序取一条"（时间相同取事件号
+  较小者），`/splits`、`/splits/explain`、批量结果、更正预演与成绩发布共用同一套选择 / 重算函数；
+- 入选解释接口对该选手的打卡只执行一次查询，解释分组与 `splits` 分段共用同一份内存行快照，
+  保证解释与分段基于同一次数据库读取；
 - 时间统一归一化为 UTC 存储，无时区的时间按 UTC 处理；
 - 更正与写入在同一事务中完成，事件号唯一性由数据库主键保证（重复返回 409）；
 - 批量登记在同一数据库事务内按顺序处理全部记录，任一失败即整体回滚（含已做的状态变更），

@@ -16,6 +16,7 @@ from .models import (
     CorrectionPreview,
     PreviewCorrectionOut,
     PublicationOut,
+    SplitsExplainOut,
     SplitsOut,
 )
 
@@ -34,12 +35,14 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="越野赛分段计时 API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "接收带唯一事件号的打卡，支持按事件号更正 / 撤销、批量登记（同一事务，"
         "任一失败整体回滚），并可预演更正（整体回滚）；"
         "按站点顺序重算相邻站分段用时，缺站或时间倒退的分段标记为待定；"
-        "支持发布不可变成绩版本（同一事务整版原子快照）并按版本 / 最新版查询。"
+        "支持发布不可变成绩版本（同一事务整版原子快照）并按版本 / 最新版查询；"
+        "提供分段入选解释（/api/runners/{id}/splits/explain），逐站列出全部打卡"
+        "是否入选及未入选原因，解释与分段结果基于同一次数据库读取。"
     ),
     lifespan=lifespan,
 )
@@ -140,6 +143,17 @@ def get_splits(
     runner_id: str, conn: sqlite3.Connection = Depends(get_db)
 ) -> SplitsOut:
     return service.get_splits(conn, runner_id)
+
+
+@app.get(
+    "/api/runners/{runner_id}/splits/explain",
+    response_model=SplitsExplainOut,
+    summary="解释实时分段采用哪些打卡，并返回基于同一次读取的分段结果",
+)
+def get_splits_explain(
+    runner_id: str, conn: sqlite3.Connection = Depends(get_db)
+) -> SplitsExplainOut:
+    return service.explain_splits(conn, runner_id)
 
 
 @app.post(
